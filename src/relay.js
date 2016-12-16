@@ -163,9 +163,11 @@ export function sequelizeConnection({
    * @param  {Integer}  index  the index of this item within the results, 0 indexed
    * @return {String}          The Base64 encoded cursor string
    */
-  let toCursor = function (item, index) {
+  let toCursor = function (item, index, fullCount, direction) {
     let id = item.get(model.primaryKeyAttribute);
-    return base64(PREFIX + id + SEPERATOR + index);
+    const config = [id, index, fullCount];
+    if (direction) config.push(direction);
+    return base64(`${PREFIX}${config.join(SEPERATOR)}`);
   };
 
   /**
@@ -174,13 +176,16 @@ export function sequelizeConnection({
    * @return {Object}        Object containing ID and index
    */
   let fromCursor = function (cursor) {
+    if (!cursor) return { id: null, index: 0, total: 0 };
     cursor = unbase64(cursor);
     cursor = cursor.substring(PREFIX.length, cursor.length);
-    let [id, index] = cursor.split(SEPERATOR);
+    let [id, index, total, direction] = cursor.split(SEPERATOR);
 
     return {
       id,
-      index
+      index: Number(index),
+      total: Number(total),
+      direction,
     };
   };
 
@@ -195,55 +200,81 @@ export function sequelizeConnection({
     return result;
   };
 
-  let resolveEdge = function (item, index, queriedCursor, args = {}, source) {
-    let startIndex = null;
-    if (queriedCursor) startIndex = Number(queriedCursor.index);
-    if (startIndex !== null) {
-      startIndex++;
-    } else {
-      startIndex = 0;
-    }
-
+  let resolveEdge = function (item, index, startIndex, fullCount, args = {}, source, context) {
+    let cursorIndex = startIndex + index;
+    const direction = context && context.direction || null;
     return {
-      cursor: toCursor(item, index + startIndex),
+      cursor: toCursor(item, cursorIndex, fullCount, direction),
       node: item,
-      source: source
+      source: source,
+      index: cursorIndex,
     };
+  };
+
+  const getFullCount = async(args, source, context, info) => {
+    // In case of `OVER()` is not available, we need to get the full count from a second query.
+    const options = await Promise.resolve(before({
+      where: argsToWhere(args)
+    }, args, context, info));
+
+    if (target.count) {
+      if (target.associationType) {
+        return await target.count(source, options);
+      } else {
+        return await target.count(options);
+      }
+    } else {
+      return await target.manyFromSource.count(source, options);
+    }
+    return 0;
   };
 
   let $resolver = require('./resolver')(target, {
     handleConnection: false,
     list: true,
-    before: function (options, args, context, info) {
-      if (args.first || args.last) {
-        options.limit = parseInt(args.first || args.last, 10);
-      }
-      if (!args.orderBy) {
-        args.orderBy = [orderByEnum._values[0].value];
-      } else if (typeof args.orderBy === 'string') {
-        args.orderBy = [orderByEnum._nameLookup[args.orderBy].value];
-      }
-
+    before: async function (options, args, context, info) {
+      const cursor = fromCursor(args.before || args.after);
       let orderBy = args.orderBy;
+      if (!orderBy) {
+        orderBy = [orderByEnum._values[0].value];
+      } else if (typeof orderBy === 'string') {
+        orderBy = [orderByEnum._nameLookup[args.orderBy].value];
+      }
       let orderAttribute = orderByAttribute(orderBy[0][0], {
         source: info.source,
         args,
         context,
         info
       });
+
       let orderDirection = orderByDirection(orderBy[0][1], args);
+      let pageDirection = args.first ? 'first' : 'last';
+
+      if (cursor.index > 0) options.offset = cursor.index + 1;
+
+      if (cursor.direction && pageDirection !== cursor.direction) {
+        context.reversed = true;
+        options.offset = cursor.total - cursor.index;
+        context.offset = options.offset;
+      }
+
+      if (args.first || args.last) {
+        options.limit = parseInt(args.first || args.last, 10);
+      }
 
       options.order = [
         [orderAttribute, orderDirection]
       ];
 
       if (orderAttribute !== model.primaryKeyAttribute) {
-        options.order.push([model.primaryKeyAttribute, orderByDirection('ASC', args)]);
+        options.order.push([model.primaryKeyAttribute, orderDirection]);
       }
 
       if (typeof orderAttribute === 'string') {
         options.attributes.push(orderAttribute);
       }
+
+      context.direction = args.first ? 'first' : 'last';
 
       if (options.limit && !options.attributes.some(attribute => attribute.length === 2 && attribute[1] === 'full_count')) {
         if (model.sequelize.dialect.name === 'postgres') {
@@ -260,72 +291,38 @@ export function sequelizeConnection({
       }
 
       options.where = argsToWhere(args);
-
-      if (args.after || args.before) {
-        let cursor = fromCursor(args.after || args.before);
-        let startIndex = Number(cursor.index);
-
-        if (startIndex >= 0) options.offset = startIndex + 1;
-      }
       options.attributes = _.uniq(options.attributes);
+      context.options = options;
       return before(options, args, context, info);
     },
     after: async function (values, args, context, info) {
-      const {
-        source,
-      } = info;
+      const { source } = info;
 
-      var cursor = null;
+      const cursor = fromCursor(args.before || args.after);
 
-      if (args.after || args.before) {
-        cursor = fromCursor(args.after || args.before);
+      let fullCount = values[0] && values[0].dataValues.full_count && parseInt(values[0].dataValues.full_count, 10);
+
+      if (!values[0]) {
+        fullCount = await getFullCount(args, source, context, info);
       }
 
+      let startIndex = context.reversed ? context.offset - 1 : cursor.index;
+      if (startIndex > 0) startIndex++;
+
       let edges = values.map((value, idx) => {
-        return resolveEdge(value, idx, cursor, args, source);
+        return resolveEdge(value, idx, startIndex, fullCount, args, source, context);
       });
 
       let firstEdge = edges[0];
       let lastEdge = edges[edges.length - 1];
-      let fullCount = values[0] && values[0].dataValues.full_count && parseInt(values[0].dataValues.full_count, 10);
-
-      if (!values[0]) {
-        fullCount = 0;
-      }
-
-      if ((args.first || args.last) && (fullCount === null || fullCount === undefined)) {
-        // In case of `OVER()` is not available, we need to get the full count from a second query.
-        const options = await Promise.resolve(before({
-          where: argsToWhere(args)
-        }, args, context, info));
-
-        if (target.count) {
-          if (target.associationType) {
-            fullCount = await target.count(source, options);
-          } else {
-            fullCount = await target.count(options);
-          }
-        } else {
-          fullCount = await target.manyFromSource.count(source, options);
-        }
-      }
 
       let hasNextPage = false;
       let hasPreviousPage = false;
       if (args.first || args.last) {
-        const count = parseInt(args.first || args.last, 10);
-        let index = cursor ? Number(cursor.index) : null;
-        if (index !== null) {
-          index++;
-        } else {
-          index = 0;
-        }
-
-        hasNextPage = index + 1 + count <= fullCount;
-        hasPreviousPage = index - count >= 0;
-
-        if (args.last) {
-          [hasNextPage, hasPreviousPage] = [hasPreviousPage, hasNextPage];
+        if (firstEdge || lastEdge) {
+          hasNextPage = lastEdge.index + 1 < fullCount;
+          hasPreviousPage = firstEdge.index > 0;
+          if (args.last || context.reversed) [hasNextPage, hasPreviousPage] = [hasPreviousPage, hasNextPage];
         }
       }
 

@@ -912,6 +912,79 @@ describe('relay', function () {
       verify(lastResult, lastThree);
       expect(lastResult.data.user.tasks.pageInfo.hasNextPage).to.equal(true);
       expect(lastResult.data.user.tasks.pageInfo.hasPreviousPage).to.equal(false);
+
+    });
+
+    it('should support switching order in pagination', async function () {
+      let firstThree = this.userA.tasks.slice(0, 3);
+      let nextThree = this.userA.tasks.slice(3, 6);
+      let lastThree = this.userA.tasks.slice(6, 9);
+
+      expect(firstThree.length).to.equal(3);
+      expect(nextThree.length).to.equal(3);
+      expect(lastThree.length).to.equal(3);
+
+      let verify = function (result, expectedTasks) {
+        if (result.errors) throw new Error(result.errors[0].stack);
+
+        var resultTasks = result.data.user.tasks.edges.map(function (edge) {
+          return edge.node;
+        });
+
+        let resultIds = resultTasks.map((task) => {
+          return parseInt(fromGlobalId(task.id).id, 10);
+        }).sort();
+
+        let expectedIds = expectedTasks.map(function (task) {
+          return task.get('id');
+        }).sort();
+
+        expect(resultTasks.length).to.equal(3);
+        expect(resultIds).to.deep.equal(expectedIds);
+      };
+
+      let query = (before, after) => {
+        let args = `last: 3`;
+        if (before) args += `, before: "${before}"`;
+        if (after) args = `first: 3, after: "${after}"`;
+        return graphql(this.schema, `
+          {
+            user(id: ${this.userA.id}) {
+              tasks(${args}, orderBy: LATEST) {
+                edges {
+                  cursor
+                  node {
+                    id
+                    name
+                  }
+                }
+                pageInfo {
+                  hasNextPage
+                  hasPreviousPage
+                  endCursor
+                  startCursor
+                }
+              }
+            }
+          }
+        `, null, {});
+      };
+
+      let firstResult = await query();
+      verify(firstResult, firstThree);
+      expect(firstResult.data.user.tasks.pageInfo.hasNextPage).to.equal(false);
+      expect(firstResult.data.user.tasks.pageInfo.hasPreviousPage).to.equal(true);
+
+      let nextResult = await query(firstResult.data.user.tasks.pageInfo.endCursor);
+      verify(nextResult, nextThree);
+      expect(nextResult.data.user.tasks.pageInfo.hasNextPage).to.equal(true);
+      expect(nextResult.data.user.tasks.pageInfo.hasPreviousPage).to.equal(true);
+
+      let lastResult = await query(null, nextResult.data.user.tasks.pageInfo.startCursor);
+      verify(lastResult, firstThree);
+      expect(lastResult.data.user.tasks.pageInfo.hasNextPage).to.equal(true);
+      expect(lastResult.data.user.tasks.pageInfo.hasPreviousPage).to.equal(false);
+
     });
 
     it('should support fetching the next element although it has the same orderValue', async function () {
